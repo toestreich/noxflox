@@ -21,6 +21,7 @@ If brokers keep sending that link instead of an email checklist, the MVP worked.
 | Accounts | Email magic-link sign-in | Email magic-link sign-in, brokerage name |
 | Passport | Profile, move-in date, target rent, document slots | n/a |
 | Documents | Upload ID, pay stubs, bank statements, W-2/tax return, employer letter, landlord reference | View through short-lived links, with every view logged |
+| Redaction | Black out SSNs, account numbers or anything else **in the browser, before upload**, with automatic suggestions for text PDFs | Sees the document labelled "Redacted in NoxFlox · N areas hidden" |
 | AI | Parse docs into fields and show the renter what's missing | One-page applicant summary, consistency flags, income-to-rent ratio |
 | Sharing | Share with a broker (from an intake link or by email), set an expiry, revoke, see the access log | See passports shared with them |
 | Intake | n/a | Create an intake link per listing (rent, required docs) and see a list of applicants |
@@ -29,7 +30,8 @@ If brokers keep sending that link instead of an email checklist, the MVP worked.
 - Bank and payroll connections (Plaid / Argyle / Pinwheel). M2, Plaid sandbox is free to develop against.
 - Identity verification (ID scan + selfie). M2, needs a paid vendor.
 - Credit checks. Needs FCRA review and a bureau partner. **The MVP never collects SSNs.**
-- Households, roommates and guarantors. M2.
+- Households, roommates and guarantors. M4.
+- Redaction suggestions for photos and scanned PDFs (needs OCR in the browser, e.g. Tesseract.js). Drawing boxes by hand works on every file in the MVP.
 - Payments, billing, team workspaces, board-package export, API.
 
 ### Vocabulary: be honest about "verified"
@@ -111,7 +113,7 @@ auth.users ─1:1─ profiles (role: renter | broker)
 |---|---|---|
 | `profiles` | `id` (= auth user), `role`, `full_name`, `brokerage_name` | Role is set once at onboarding |
 | `passports` | `owner_id`, `target_rent`, `move_in_date`, `status` | One per renter for the MVP |
-| `documents` | `passport_id`, `kind`, `storage_path`, `mime_type`, `size_bytes`, `status` | `kind` is an enum of document slots |
+| `documents` | `passport_id`, `kind`, `storage_path`, `mime_type`, `size_bytes`, `status`, `redacted`, `redactions` (jsonb) | `kind` is an enum of document slots. `redactions` stores box positions only, never the hidden text |
 | `extractions` | `document_id`, `model`, `fields` (jsonb), `flags` (jsonb) | Written only by the server |
 | `intake_requests` | `broker_id`, `token`, `listing_address`, `monthly_rent`, `required_kinds[]`, `expires_at` | The token appears in the public URL |
 | `shares` | `passport_id`, `broker_id`, `intake_request_id?`, `scope`, `expires_at`, `revoked_at` | **The access-control primitive** |
@@ -137,11 +139,27 @@ The schema will live in `supabase/migrations/` as SQL with RLS policies.
 1. The client asks the server for an upload slot. The server validates kind, MIME type (PDF/JPEG/PNG/HEIC) and size (≤ 10 MB), creates a `documents` row, and returns a signed upload URL scoped to `{passport_id}/{document_id}`.
 2. The client uploads straight to Storage, then the server marks the doc `uploaded` and queues parsing. The MVP does this inline in a server action; Supabase Queues or a cron job come later.
 3. Parsing sends the file to Claude with a strict JSON schema per `kind` (employer, pay period, gross pay, YTD, account holder name, balances...). The result is stored in `extractions`.
-4. Consistency checks are deterministic code, not AI: names match across docs, pay-stub dates are recent, the income figure is consistent, there's a flag if an SSN is detected (we tell the renter to redact it).
+4. Consistency checks are deterministic code, not AI: names match across docs, pay-stub dates are recent, the income figure is consistent, there's a flag if an SSN is still detected. That's a backstop to flow D: the document can't be shared until the renter replaces it with a redacted copy, and the original is deleted.
 5. The status becomes `checked`, and the renter sees what was extracted and can correct it.
 
 **C. Broker views a document**
 `GET /api/documents/{id}/view` → load the document plus an active share for this broker → insert `access_events(view_document)` → create a signed URL (60s, `download` disposition) → redirect. With no active share the route returns 404, never 403, so it doesn't leak that the document exists.
+
+**D. Redaction (entirely in the browser, before upload)**
+
+The original file never leaves the renter's computer. That's the strongest privacy promise we can make: we never saw the SSN, not even briefly.
+
+1. **Load.** pdf.js renders PDF pages to a canvas, and images load directly. Chrome can't decode HEIC, so either convert it in the browser (heic2any) or drop HEIC from the allow-list.
+2. **Suggest.** pdf.js returns each word with its position on the page. Patterns flag SSNs, long account or routing numbers near labels like "acct" or "routing", and dates of birth, and pre-tick them as suggested boxes. Scans and photos have no text layer, so they get no suggestions until OCR lands.
+3. **Edit.** The renter adds or removes boxes. Each box is stored as `{page, x, y, w, h, source: auto|manual}` in page-relative units. Warn when a box covers words brokers need (name, employer, pay dates, amounts).
+4. **Burn in.** Render every page at about 150 DPI, fill the boxes solid black, export JPEG, and rebuild the PDF from those images with pdf-lib. The output has **no text layer and no metadata**, and re-encoding the image drops photo EXIF. Drawing boxes on top of a PDF without flattening it is not redaction, because the text underneath stays copyable.
+5. **Upload the result** through flow B, with `redacted = true` and the box positions. Brokers see "Redacted in NoxFlox · N areas hidden".
+6. **Test it.** CI runs fixture documents with known SSNs through the pipeline and asserts that text extraction of the output returns nothing, there's no metadata, and the pixels inside every box are black.
+
+Trade-offs:
+- **Why flatten instead of true PDF redaction:** the good free library for removing text objects (PyMuPDF/MuPDF) is AGPL-licensed, and commercial SDKs (Apryse, Nutrient) are expensive. Flattening is free, simple and hard to get wrong.
+- **What it costs:** flattening throws away PDF-level forensic signals (fonts, metadata, edit history) that help spot doctored pay stubs. Mitigations: the "redacted" label, cross-document consistency checks, and bank or payroll verification (M4), which makes document forensics matter much less.
+- **File size:** image-only PDFs are bigger. 150 DPI JPEG keeps a typical pay stub well under the 10 MB cap.
 
 ---
 
@@ -163,7 +181,7 @@ Guardrails:
 
 ## 7. Security and privacy baseline (MVP)
 
-- **Data minimization:** no SSN, no date-of-birth field, no credit data. If a document contains an SSN, flag it and ask the renter to upload a redacted copy.
+- **Data minimization:** no SSN, no date-of-birth field, no credit data. Renters black out sensitive details in the browser before upload (flow D), and a server-side SSN check catches anything missed.
 - **Encryption:** TLS everywhere. Supabase encrypts at rest. Per-passport application-level encryption is deferred to post-pilot.
 - **RLS on every table**, default deny. A CI test asserts that every table in `public` has RLS enabled.
 - **Private storage bucket.** Access only through signed URLs issued by our server.
@@ -201,7 +219,7 @@ noxflox-app/
 | Milestone | Scope | Done when |
 |---|---|---|
 | **M0: skeleton** | Next.js + Supabase wiring, schema + RLS, magic-link auth, role onboarding, CI | A renter and a broker can sign in, and the RLS tests pass |
-| **M1: core loop** | Passport + uploads, intake links, shares (expiry/revoke), broker applicant view, document viewer, access log | A broker can take a real application end-to-end with no AI |
+| **M1: core loop** | Passport + uploads, in-browser redaction (manual boxes + text-PDF suggestions), intake links, shares (expiry/revoke), broker applicant view, document viewer, access log | A broker can take a real application end-to-end with no AI |
 | **M2: AI** | Parsing, consistency flags, applicant summary, renter "what's missing" | The summary is accurate on 20 sample applications |
 | **M3: pilot hardening** | Retention jobs, error monitoring, security headers, legal pages, Supabase Pro, custom domain | 5 pilot brokers onboarded |
 | **M4: verified** | Plaid sandbox → production, ID verification vendor, households/guarantors | The first `verified` badge goes live |
